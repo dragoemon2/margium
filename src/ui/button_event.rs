@@ -1,3 +1,4 @@
+use poppler::{Document};
 use gtk4::prelude::*;
 use gtk4::{
     ApplicationWindow, DrawingArea, TextBuffer, Label, 
@@ -9,7 +10,8 @@ use std::cell::RefCell;
 use crate::engine::PdfEngine;
 use crate::ui::{UiState};
 use crate::ui::toolbar::ToolbarWidgets;
-use crate::ui::sidebar::SidebarWidgets;
+use crate::ui::sidebar::{SidebarWidgets, ThumbnailResult};
+use crate::annotations;
 
 pub fn setup(
     window: &ApplicationWindow,
@@ -52,7 +54,7 @@ pub fn setup(
             // 4. サムネイル更新
             let current_page = engine.borrow().get_current_page_number();
             sb_view.scroll_to_thumbnail(current_page);
-            sb_view.update_thumbnails(&eng);
+            // sb_view.update_thumbnails(&eng);
             
         }
     };
@@ -103,6 +105,7 @@ pub fn setup(
     
     // ファイル選択ダイアログの処理を関数化（ショートカットからも呼べるように）
     let sidebar_for_open = sidebar.clone();
+    let drawing_area_open = drawing_area.clone();
 
     let open_action = move || {
         let window = match window_weak.upgrade() { Some(w) => w, None => return };
@@ -116,24 +119,151 @@ pub fn setup(
 
         let eng = eng_open.clone();
         let up = up_open.clone();
-
         let sb = sidebar_for_open.clone();
+        let area = drawing_area_open.clone();
 
         dialog.connect_response(move |d, response| {
             if response == ResponseType::Accept {
                 if let Some(file) = d.file() {
                     if let Some(path) = file.path() {
-                        if let Err(e) = eng.borrow_mut().load_file(path) {
+                        if let Err(e) = eng.borrow_mut().load_file(path.clone()) {
                             eprintln!("Error: {}", e);
                         } else {
-
                             // サイドバー更新 (Annotationsのみ。Thumbnailsは up() に含まれる)
                             let eng_ref = eng.borrow();
                             sb.update_annotations(&eng_ref);
-                            sb.init_thumbnails(eng_ref.get_total_pages());
+                            sb.prepare_empty_thumbnails(eng_ref.get_total_pages());
+                            // sb.init_thumbnails(eng_ref.get_total_pages());
 
                             // 画面更新
                             up(); 
+
+                            let path_for_thread = path.to_str().unwrap().to_string();
+
+                            // A. アノテーション用
+                            let (annot_sender, annot_receiver) = async_channel::unbounded::<Result<Vec<annotations::AnnotationData>, String>>();
+                            // B. サムネイル用
+                            let (thumb_sender, thumb_receiver) = async_channel::unbounded::<ThumbnailResult>();
+
+                            let eng_async = eng.clone();
+                            let area_async = area.clone();
+                            let sidebar_async = sb.clone(); // サムネイル更新用
+
+                            // -------------------------------------------------------------------------
+                            // 2. メインスレッド側 (受信): 2つのレシーバーを待ち受ける
+                            // -------------------------------------------------------------------------
+
+                            // 受信処理 A: アノテーション
+                            gtk4::glib::MainContext::default().spawn_local(async move {
+                                while let Ok(result) = annot_receiver.recv().await {
+                                    match result {
+                                        Ok(annots) => {
+                                            println!("Loaded {} annotations.", annots.len());
+                                            eng_async.borrow_mut().set_annotations(annots);
+                                            area_async.queue_draw();
+                                            // 必要ならサイドバーのアノテーションリストも更新
+                                            // sidebar_for_annot.update_annotations(...)
+                                        }
+                                        Err(e) => eprintln!("Annot Error: {}", e),
+                                    }
+                                }
+                            });
+
+                            // 受信処理 B: サムネイル
+                            // ※ spawn_localはいくつでも作れます。これらは並行して動きます。
+                            gtk4::glib::MainContext::default().spawn_local(async move {
+                                while let Ok(res) = thumb_receiver.recv().await {
+                                    // 生データからTexture復元
+                                    let bytes = gtk4::glib::Bytes::from(&res.pixels);
+                                    let texture = gtk4::gdk::MemoryTexture::new(
+                                        res.width,
+                                        res.height,
+                                        gtk4::gdk::MemoryFormat::B8g8r8a8Premultiplied, 
+                                        &bytes,
+                                        res.stride as usize,
+                                    );
+                                    // サイドバーに反映
+                                    sidebar_async.set_thumbnail_image(res.page_index, &texture.into());
+                                }
+                            });
+
+                            // -------------------------------------------------------------------------
+                            // 3. ワーカースレッド (送信): 1つのスレッドで順次実行
+                            // -------------------------------------------------------------------------
+                            let pdf_path = path_for_thread.clone(); // パス
+
+                            std::thread::spawn(move || {
+                                println!("Loading Annotations");
+                                // === JOB 1: アノテーション読み込み ===
+                                // これは一瞬で終わるので最初にやる
+                                let annot_result = annotations::load_annotations(pdf_path.clone());
+                                // 送信 (失敗したら受信側がいないので終了)
+                                if annot_sender.send_blocking(annot_result).is_err() {
+                                    return; 
+                                }
+
+                                println!("Generating Thumbnails");
+                                // === JOB 2: サムネイル生成 ===
+                                // 続けて重い処理を開始
+                                let uri = format!("file://{}", pdf_path);
+                                
+                                // PDFを再オープン (engine.rsと同じライブラリで)
+                                if let Ok(doc) = Document::from_file(&uri, None) {
+                                    let total = doc.n_pages();
+                                    
+                                    for i in 0..total {
+                                        // ドキュメント全体をロックしないよう、ページ取得スコープを狭めるなどの配慮があればベター
+                                        if let Some(page) = doc.page(i) {
+
+                                            
+                                            
+                                            // --- 描画処理 (前回と同じ) ---
+                                            let target_width = 150.0;
+                                            let (w, h) = page.size();
+                                            let scale = target_width / w;
+                                            let width_px = target_width as i32;
+                                            let height_px = (h * scale) as i32;
+
+                                            if let Ok(mut surface) = cairo::ImageSurface::create(cairo::Format::ARgb32, width_px, height_px) {
+
+                                                
+                                                surface.flush();
+
+                                                
+                                                let stride = surface.stride();
+                                                {
+                                                    if let Ok(ctx) = cairo::Context::new(&surface) {
+                                                        ctx.set_source_rgb(1.0, 1.0, 1.0); // 白背景
+                                                        ctx.rectangle(0.0, 0.0, target_width, h * scale);
+                                                        ctx.fill().unwrap();
+                                                        ctx.scale(scale, scale);
+                                                        page.render(&ctx);
+                                                    }
+                                                }
+
+                                                // --- 送信 ---
+                                                if let Ok(data) = surface.data() {
+                                                    let res = ThumbnailResult {
+                                                        page_index: i,
+                                                        width: width_px,
+                                                        height: height_px,
+                                                        stride,
+                                                        pixels: data.to_vec(),
+                                                    };
+                                                    
+                                                    // 1枚ごとに送信
+                                                    if thumb_sender.send_blocking(res).is_err() {
+                                                        break; // アプリが終了していたらループを抜ける
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        // UIスレッドを少し休ませる（カクつき防止）
+                                        std::thread::sleep(std::time::Duration::from_millis(10)); 
+                                    }
+                                }
+                                println!("Thumbnail generation thread done.");
+                            });
                         }
                     }
                 }
@@ -145,6 +275,9 @@ pub fn setup(
 
     // ボタンに接続
     let open_action_clone = open_action.clone(); // クローンしてボタン用に使う
+    // widgets.btn_open.connect_clicked(move |_| {
+    //     open_action_clone();
+    // });
     widgets.btn_open.connect_clicked(move |_| {
         open_action_clone();
     });
