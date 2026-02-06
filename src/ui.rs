@@ -4,7 +4,7 @@ use gtk4::{
     ResponseType, ScrolledWindow, Button, Label, Orientation, 
     EventControllerKey, EventControllerScroll, EventControllerScrollFlags,
     Separator, DropDown, StringList, GestureClick, Popover,
-    Entry, Window
+    Entry, Window, TextView, Paned
 };
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -80,11 +80,16 @@ pub fn build(app: &Application) {
     toolbar.append(&spacer);
 
     // ボタン群 (Right)
+    let btn_prev = Button::with_label("◀");
+    let label_page = Label::new(Some(" - / - "));
+    let btn_next = Button::with_label("▶");
     let btn_open = Button::with_label("📂 Open");
     let btn_save = Button::with_label("💾 Save"); // 機能未実装のため飾り
     let btn_save_as = Button::with_label("💾 Save As"); // 飾り
     let btn_zoom_in = Button::with_label("🔍 Zoom In");
     let btn_zoom_out = Button::with_label("🔍 Zoom Out");
+    
+
     
     // 言語選択 (Dropdown)
     let lang_list = StringList::new(&["English", "Japanese"]);
@@ -107,34 +112,57 @@ pub fn build(app: &Application) {
     let h_sep = Separator::new(Orientation::Horizontal);
     main_content.append(&h_sep);
 
-    // --- B-2. PDF表示エリア (Bottom) ---
+    // --- B-2. スプリットビュー (Paned) ---
+    let paned = Paned::new(Orientation::Horizontal);
+    paned.set_position(600); // PDF側の初期幅
+    paned.set_vexpand(true); // 高さいっぱいに
+    main_content.append(&paned);
+
+
+    // [左側] PDF表示エリア
     let drawing_area = DrawingArea::new();
     drawing_area.set_content_width(800);
     drawing_area.set_content_height(1000);
+    drawing_area.set_focusable(true);
+    drawing_area.set_can_focus(true);
 
-    let scrolled_window = ScrolledWindow::builder()
+    let pdf_scroll = ScrolledWindow::builder()
         .hscrollbar_policy(gtk4::PolicyType::Automatic)
         .vscrollbar_policy(gtk4::PolicyType::Automatic)
         .child(&drawing_area)
-        .vexpand(true) // 高さいっぱいまで広げる
         .build();
 
-    main_content.append(&scrolled_window);
+    // Panedの左側にセット
+    paned.set_start_child(Some(&pdf_scroll));
 
-    // ポップオーバーメニュー
-    let popover = Popover::builder()
-        .has_arrow(false)
+
+    // [右側] テキスト表示エリア
+    let text_view = TextView::new();
+    text_view.set_editable(false); // 読み取り専用
+    text_view.set_wrap_mode(gtk4::WrapMode::WordChar); // 折り返し
+    text_view.set_left_margin(10);
+    text_view.set_right_margin(10);
+    text_view.set_top_margin(10);
+    text_view.set_bottom_margin(10);
+
+    let text_buffer = text_view.buffer(); // テキストセット用
+
+    let text_scroll = ScrolledWindow::builder()
+        .child(&text_view)
         .build();
+    text_scroll.set_size_request(200, -1); // 最低幅
+
+    // Panedの右側にセット
+    paned.set_end_child(Some(&text_scroll));
+
+
+    // --- ポップオーバー (DrawingAreaに追加) ---
+    let popover = Popover::builder().has_arrow(false).build();
     let menu_box = gtk4::Box::new(Orientation::Vertical, 0);
-
-    // メニュー項目
     let add_annot_btn = Button::with_label(" ➕ Add Annotation ");
-    add_annot_btn.set_has_frame(false); // メニュー項目っぽく枠線を消す
-    
+    add_annot_btn.set_has_frame(false);
     menu_box.append(&add_annot_btn);
     popover.set_child(Some(&menu_box));
-    
-    // DrawingAreaを親にする
     popover.set_parent(&drawing_area);
 
 
@@ -168,6 +196,7 @@ pub fn build(app: &Application) {
         let label = filename_label.clone();
         let engine = engine.clone();
         let btn_save = btn_save.clone();
+        let buf = text_buffer.clone();
         
         move || {
             let eng = engine.borrow();
@@ -178,10 +207,36 @@ pub fn build(app: &Application) {
             btn_save.set_sensitive(true);
 
             area.queue_draw();
+
+            if let Some(text) = eng.get_current_text() {
+                buf.set_text(&text);
+            } else {
+                buf.set_text("");
+            }
         }
     };
 
     // --- ボタンアクション ---
+
+    // --- Prev Button ---
+    let eng_prev = engine.clone();
+    let update_ui_prev = update_view.clone();
+
+    btn_prev.connect_clicked(move |_| {
+        if eng_prev.borrow_mut().prev_page() {
+            update_ui_prev();
+        }
+    });
+
+    // --- Next Button ---
+    let eng_next = engine.clone();
+    let update_ui_next = update_view.clone();
+
+    btn_next.connect_clicked(move |_| {
+        if eng_next.borrow_mut().next_page() {
+            update_ui_next();
+        }
+    });
 
     // Open
     let engine_open = engine.clone();
@@ -204,6 +259,7 @@ pub fn build(app: &Application) {
         let eng = engine_open.clone();
         let up = update_open.clone();
         let area = area_open.clone();
+        let buf = text_buffer.clone();
 
         dialog.connect_response(move |d, response| {
             if response == ResponseType::Accept {
@@ -221,6 +277,11 @@ pub fn build(app: &Application) {
                         // ここで一旦描画更新！ ユーザーにはPDFが表示される
                         up(); 
 
+                        if let Some(text) = eng.borrow_mut().get_current_text() {
+                            buf.set_text(&text);
+                        } else {
+                            buf.set_text("(No text found on this page)");
+                        }
 
                         // 2. バックグラウンドでアノテーションを読み込む (非同期処理・低速)
                         
@@ -444,6 +505,17 @@ pub fn build(app: &Application) {
         dialog.present();
     });
 
+    // --- DrawingArea Click (フォーカス奪取) ---
+    // これがないと、TextViewを選択した後にPDF操作（キーボードショートカット等）ができなくなる
+    let click_ctrl = GestureClick::new();
+    let area_focus = drawing_area.clone();
+    
+    click_ctrl.connect_pressed(move |_, _, _, _| {
+        // クリックされたらフォーカスをDrawingAreaに移す
+        area_focus.grab_focus();
+        println!("PDF focused"); // デバッグ用
+    });
+    drawing_area.add_controller(click_ctrl);
 
     window.present();
 }

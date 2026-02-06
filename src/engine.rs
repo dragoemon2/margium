@@ -1,4 +1,4 @@
-use poppler::{Document};
+use poppler::{Document, Rectangle};
 use std::path::PathBuf;
 use cairo::Context;
 use crate::annotations::{AnnotationData};
@@ -83,6 +83,16 @@ impl PdfEngine {
         None
     }
 
+    pub fn get_current_text(&self) -> Option<String> {
+        if let Some(doc) = &self.doc {
+            if let Some(page) = doc.page(self.current_page) {
+                return page.text().map(|s| s.to_string());
+            }
+        }
+        None
+    }
+
+
     pub fn add_annotation(&mut self, text: &str, x: f64, y: f64) -> Result<(), String> {
         // 1. リストに追加
         self.annotations.push(AnnotationData {
@@ -97,7 +107,6 @@ impl PdfEngine {
 
         Ok(())
     }
-
 
     pub fn draw(&self, context: &Context, area_width: f64, area_height: f64, scale: f64) {
         // ---------------------- PDF描画処理 ----------------------
