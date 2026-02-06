@@ -30,6 +30,14 @@ impl PdfEngine {
         }
     }
 
+    pub fn jump_to_page(&mut self, page_index: i32) -> bool {
+        if page_index >= 0 && page_index < self.total_pages {
+            self.current_page = page_index;
+            return true;
+        }
+        false
+    }
+
     pub fn load_file(&mut self, path: PathBuf) -> Result<(), String> {
         let uri = format!("file://{}", path.to_str().unwrap_or(""));
         
@@ -68,7 +76,15 @@ impl PdfEngine {
 
     pub fn status_text(&self) -> String {
         if self.total_pages > 0 {
-            format!("{} - {} / {}", self.filename, self.current_page + 1, self.total_pages)
+            format!("{}", self.filename)
+        } else {
+            " ".to_string()
+        }
+    }
+
+    pub fn page_info(&self) -> String {
+        if self.total_pages > 0 {
+            format!("{} / {}", self.current_page + 1, self.total_pages)
         } else {
             " - ".to_string()
         }
@@ -81,6 +97,10 @@ impl PdfEngine {
             }
         }
         None
+    }
+
+    pub fn get_total_pages(&self) -> i32 {
+        self.total_pages
     }
 
     pub fn get_current_text(&self) -> Option<String> {

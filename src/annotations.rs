@@ -2,8 +2,7 @@ use lopdf::{Document, Object, Dictionary, StringFormat, Reader};
 use std::collections::{HashMap};
 use std::str;
 use uuid::Uuid;
-use std::{thread, time};
-use std::fs::File;
+use std::{time};
 
 // 外部で使うために pub をつける
 #[derive(Debug, Clone)]
