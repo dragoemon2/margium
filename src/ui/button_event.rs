@@ -125,7 +125,7 @@ pub fn setup(
                             // サイドバー更新
                             // sb は Rc<SidebarWidgets> なのでメソッドを呼べる
                             let eng_ref = eng.borrow();
-                            // sb.update_thumbnails(eng_ref.get_total_pages());
+                            sb.update_thumbnails(eng_ref.get_total_pages());
                             sb.update_annotations(&eng_ref);
                         }
                     }

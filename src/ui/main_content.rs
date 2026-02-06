@@ -1,7 +1,7 @@
 use gtk4::prelude::*;
 use gtk4::{
     Box as GtkBox, DrawingArea, Orientation, Paned, ScrolledWindow, 
-    TextView, TextBuffer, Separator, Label,
+    TextView, TextBuffer, Separator, 
     GestureClick, EventControllerScroll, EventControllerScrollFlags,
 };
 use std::rc::Rc;
@@ -108,16 +108,4 @@ pub fn build(
     pdf_scroll_window.add_controller(scroll_ctrl.clone());
 
     (container, drawing_area, text_buffer)
-}
-
-// サイドバー作成用ヘルパー
-pub fn build_sidebar() -> GtkBox {
-    let sidebar = GtkBox::new(Orientation::Vertical, 0);
-    sidebar.set_width_request(250);
-    
-    let label = Label::new(Some("Sidebar"));
-    label.set_margin_top(10);
-    sidebar.append(&label);
-    
-    sidebar
 }

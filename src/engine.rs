@@ -1,4 +1,4 @@
-use poppler::{Document, Rectangle};
+use poppler::{Document};
 use std::path::PathBuf;
 use cairo::Context;
 use crate::annotations::{AnnotationData};

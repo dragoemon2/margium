@@ -1,5 +1,5 @@
 use gtk4::prelude::*;
-use gtk4::{Application, ApplicationWindow, Label, Orientation, Separator, FileChooserDialog, FileChooserAction, ResponseType};
+use gtk4::{Application, ApplicationWindow, Label, Orientation, Separator};
 use std::cell::RefCell;
 use std::rc::Rc;
 use crate::engine::PdfEngine;

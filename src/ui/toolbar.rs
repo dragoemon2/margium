@@ -1,7 +1,6 @@
 use gtk4::prelude::*;
 use gtk4::{
-    Box as GtkBox, Button, Label, Orientation, Separator, 
-    DropDown, StringList
+    Box as GtkBox, Button, Label, Orientation, Separator
 };
 
 

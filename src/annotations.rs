@@ -1,4 +1,4 @@
-use lopdf::{Document, Object, Dictionary, StringFormat, Reader};
+use lopdf::{Document, Object, Dictionary, StringFormat};
 use std::collections::{HashMap};
 use std::str;
 use uuid::Uuid;
