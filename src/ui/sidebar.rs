@@ -7,6 +7,8 @@ use gtk4::{
 use std::rc::Rc;
 use std::cell::RefCell;
 use crate::engine::PdfEngine;
+use std::cmp::{min, max};
+use gtk4::gdk;
 
 pub struct SidebarWidgets {
     pub container: GtkBox,
@@ -15,6 +17,7 @@ pub struct SidebarWidgets {
     pub annot_list: ListBox,
     pub search_list: ListBox,
     pub search_result_label: Label,
+    pub thumb_scroll: ScrolledWindow,
 }
 
 pub fn build(
@@ -51,11 +54,55 @@ pub fn build(
     // Tab 1: Thumbnails
     let thumb_list = ListBox::new();
     thumb_list.set_selection_mode(SelectionMode::Single);
+
+
     let thumb_scroll = ScrolledWindow::builder()
         .hscrollbar_policy(PolicyType::Never)
         .child(&thumb_list)
         .build();
     stack.add_named(&thumb_scroll, Some("thumbs"));
+
+
+    // 2. ★重要: ScrolledWindowが現在持っている「本物の」Adjustmentを取得する
+    let vadj = thumb_scroll.vadjustment();
+
+    // 3. イベント接続 (ロジックは前回と同じ)
+    {
+        // クローン等の準備
+        let list_weak = thumb_list.downgrade();
+        let scroll_weak = thumb_scroll.downgrade();
+        let engine_clone = engine.clone();
+        let debounce_timer = Rc::new(RefCell::new(None::<glib::SourceId>));
+
+        // 取得した vadj に対してシグナルを接続
+        vadj.connect_value_changed(move |_| {
+            // println!("Scroll detected!"); // これで表示されるはずです
+
+            let timer_store = debounce_timer.clone();
+            let eng = engine_clone.clone();
+            let list_w = list_weak.clone();
+            let scroll_w = scroll_weak.clone();
+
+            if let Some(source_id) = timer_store.borrow_mut().take() {
+                source_id.remove();
+            }
+
+            let timer_store_for_inner = timer_store.clone();
+
+            let new_source_id = glib::timeout_add_local(
+                std::time::Duration::from_millis(200), 
+                move || {
+                    if let (Some(list), Some(scroll)) = (list_w.upgrade(), scroll_w.upgrade()) {
+                        perform_thumbnail_update(&list, &scroll, &eng.borrow());
+                    }
+                    *timer_store_for_inner.borrow_mut() = None;
+                    glib::ControlFlow::Break
+                }
+            );
+            
+            *timer_store.borrow_mut() = Some(new_source_id);
+        });
+    }
 
     // Tab 2: Outline
     let outline_list = ListBox::new();
@@ -121,9 +168,12 @@ pub fn build(
         }
     });
 
+    
+
     SidebarWidgets {
         container,
         thumb_list,
+        thumb_scroll,
         outline_list,
         annot_list,
         search_list,
@@ -137,31 +187,220 @@ fn create_tab_button(label: &str, _name: &str) -> Button {
 
 // === 更新ロジックの実装 ===
 
+fn perform_thumbnail_update(
+    thumb_list: &ListBox, 
+    thumb_scroll: &ScrolledWindow, 
+    engine: &PdfEngine
+) {
+    let current = engine.get_current_page_number();
+    let total = engine.get_total_pages();
+    
+    // 1. スクロール情報を取得
+    let vadj = thumb_scroll.vadjustment();
+    let scroll_y = vadj.value();       // 現在のスクロール位置 (px)
+    let view_height = vadj.page_size(); // 画面の高さ (px)
+
+    // 2. 1行あたりの高さを固定値で定義 (画像100 + 余白など)
+    // ※CSSや設定で大きく変えていない限り、固定値で計算するのが一番速くて確実です
+    let item_height = 140.0; 
+
+    // 3. 表示範囲の計算 (ここが変更の核心)
+    let (min_visible, max_visible) = if view_height < 1.0 {
+        // A. 起動直後 (まだ画面高さが0の時)
+        // とりあえず現在のページ前後を表示しておく
+        let radius = 4;
+        (
+            max(0, current - radius),
+            min(total - 1, current + radius)
+        )
+    } else {
+        // B. 通常時 (スクロール位置から逆算)
+        let start_index = (scroll_y / item_height).floor() as i32;
+        let count = (view_height / item_height).ceil() as i32;
+        
+        let buffer = 2; // 上下に少し余裕を持たせる
+
+        (
+            max(0, start_index - buffer),
+            min(total - 1, start_index + count + buffer)
+        )
+    };
+
+    // リストの子要素（行）を順番に走査
+    let mut i = 0;
+    let mut child = thumb_list.first_child();
+    
+    while let Some(row_widget) = child {
+        // ListBoxRow -> Box -> Image を取り出す処理
+        if let Some(row) = row_widget.downcast_ref::<ListBoxRow>() {
+            if let Some(box_widget) = row.child() {
+                if let Some(vbox) = box_widget.downcast_ref::<GtkBox>() {
+                    // vboxの最初の子がImageだと仮定
+                    if let Some(first_child) = vbox.first_child() {
+                        if let Some(image) = first_child.downcast_ref::<Image>() {
+                            
+                            // ★判定ロジック: 範囲内なら描画、範囲外ならメモリ解放
+                            if i >= min_visible && i <= max_visible {
+                                // まだ画像がセットされていない（またはプレースホルダー）場合のみ生成
+                                // (Paintableがすでにセットされているか確認しても良いが、
+                                //  ここでは単純に範囲内ならTexture取得を試みる)
+                                //  ※ Texture生成はキャッシュが無いと毎フレーム重いので、
+                                //     本来はEngine側でLRUキャッシュを持つのがベストですが、
+                                //     ここでは「範囲外を即捨てる」ことでメモリを節約します。
+                                
+                                // 現在のPaintableが空、またはロード中でなければ再生成しない工夫も可
+                                
+                                // 画質を落とすために幅を100pxに指定
+                                if let Some(texture) = engine.get_page_thumbnail(i, 100.0) {
+                                    image.set_paintable(Some(&texture));
+                                }
+                            } else {
+                                // ★範囲外は画像をアンロードしてメモリを軽くする
+                                // アイコンに戻す、または None にする
+                                image.set_icon_name(Some("text-x-generic-symbolic"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        child = row_widget.next_sibling();
+        i += 1;
+    }
+}
+
 impl SidebarWidgets {
-    pub fn update_thumbnails(&self, total_pages: i32) {
-        // クリア
+    pub fn init_thumbnails(&self, total_pages: i32) {
+        // 既存の中身をクリア
         while let Some(child) = self.thumb_list.first_child() {
             self.thumb_list.remove(&child);
         }
-        // 再生成
+
+        // 全ページ分の「空の」枠を作る（画像はセットしない）
         for i in 0..total_pages {
             let row = ListBoxRow::new();
             let vbox = GtkBox::new(Orientation::Vertical, 5);
             vbox.set_margin_top(10);
             vbox.set_margin_bottom(10);
+            vbox.set_halign(Align::Center);
             
-            // アイコン
-            let icon = Image::from_icon_name("text-x-generic-symbolic");
-            icon.set_pixel_size(32);
+            // 画像ウィジェット（最初はプレースホルダーアイコン）
+            let image_widget = Image::new();
+            image_widget.set_pixel_size(100); // ★サイズを小さくする（150 -> 100）
+            image_widget.set_icon_name(Some("image-loading-symbolic")); // 読み込み中アイコン
+            image_widget.add_css_class("thumbnail-img"); // 後でCSSで操作できるようにクラス付与
             
             // ラベル
-            let label = Label::new(Some(&format!("Page {}", i + 1)));
+            let label = Label::new(Some(&format!("{}", i + 1))); // "Page"という文字を削ってスッキリさせる
             label.add_css_class("caption");
 
-            vbox.append(&icon);
+            vbox.append(&image_widget);
             vbox.append(&label);
             row.set_child(Some(&vbox));
+            
             self.thumb_list.append(&row);
+        }
+    }
+
+    /// ページ遷移時に呼ぶ。見えている範囲だけ画像を生成し、他は捨てる。
+    pub fn update_thumbnails(&self, engine: &PdfEngine) {
+        perform_thumbnail_update(&self.thumb_list, &self.thumb_scroll, engine);
+        // let current = engine.get_current_page_number();
+        // let total = engine.get_total_pages();
+        
+        // // 1. スクロール情報を取得
+        // let vadj = self.thumb_scroll.vadjustment();
+        // let scroll_y = vadj.value();       // 現在のスクロール位置 (px)
+        // let view_height = vadj.page_size(); // 画面の高さ (px)
+
+        // // 2. 1行あたりの高さを固定値で定義 (画像100 + 余白など)
+        // // ※CSSや設定で大きく変えていない限り、固定値で計算するのが一番速くて確実です
+        // let item_height = 140.0; 
+
+        // // 3. 表示範囲の計算 (ここが変更の核心)
+        // let (min_visible, max_visible) = if view_height < 1.0 {
+        //     // A. 起動直後 (まだ画面高さが0の時)
+        //     // とりあえず現在のページ前後を表示しておく
+        //     let radius = 4;
+        //     (
+        //         max(0, current - radius),
+        //         min(total - 1, current + radius)
+        //     )
+        // } else {
+        //     // B. 通常時 (スクロール位置から逆算)
+        //     let start_index = (scroll_y / item_height).floor() as i32;
+        //     let count = (view_height / item_height).ceil() as i32;
+            
+        //     let buffer = 2; // 上下に少し余裕を持たせる
+
+        //     (
+        //         max(0, start_index - buffer),
+        //         min(total - 1, start_index + count + buffer)
+        //     )
+        // };
+
+        // // リストの子要素（行）を順番に走査
+        // let mut i = 0;
+        // let mut child = self.thumb_list.first_child();
+        
+        // while let Some(row_widget) = child {
+        //     // ListBoxRow -> Box -> Image を取り出す処理
+        //     if let Some(row) = row_widget.downcast_ref::<ListBoxRow>() {
+        //         if let Some(box_widget) = row.child() {
+        //             if let Some(vbox) = box_widget.downcast_ref::<GtkBox>() {
+        //                 // vboxの最初の子がImageだと仮定
+        //                 if let Some(first_child) = vbox.first_child() {
+        //                     if let Some(image) = first_child.downcast_ref::<Image>() {
+                                
+        //                         // ★判定ロジック: 範囲内なら描画、範囲外ならメモリ解放
+        //                         if i >= min_visible && i <= max_visible {
+        //                             // まだ画像がセットされていない（またはプレースホルダー）場合のみ生成
+        //                             // (Paintableがすでにセットされているか確認しても良いが、
+        //                             //  ここでは単純に範囲内ならTexture取得を試みる)
+        //                             //  ※ Texture生成はキャッシュが無いと毎フレーム重いので、
+        //                             //     本来はEngine側でLRUキャッシュを持つのがベストですが、
+        //                             //     ここでは「範囲外を即捨てる」ことでメモリを節約します。
+                                    
+        //                             // 現在のPaintableが空、またはロード中でなければ再生成しない工夫も可
+                                    
+        //                             // 画質を落とすために幅を100pxに指定
+        //                             if let Some(texture) = engine.get_page_thumbnail(i, 100.0) {
+        //                                 image.set_paintable(Some(&texture));
+        //                             }
+        //                         } else {
+        //                             // ★範囲外は画像をアンロードしてメモリを軽くする
+        //                             // アイコンに戻す、または None にする
+        //                             image.set_icon_name(Some("text-x-generic-symbolic"));
+        //                         }
+        //                     }
+        //                 }
+        //             }
+        //         }
+        //     }
+            
+        //     child = row_widget.next_sibling();
+        //     i += 1;
+        // }
+        
+  
+    }
+
+    pub fn scroll_to_thumbnail(&self, page_num: i32) {
+        // 1. 指定されたページの行（Row）を取得
+        if let Some(row) = self.thumb_list.row_at_index(page_num) {
+            
+            // --- 選択状態にする (ハイライト) ---
+            self.thumb_list.select_row(Some(&row));
+
+            // 行の座標をリストボックス基準で取得
+            // (rowの左上(0,0)が、list全体の中でどこにあるか)
+            if let Some((_, y)) = row.translate_coordinates(&self.thumb_list, 0.0, 0.0) {
+                if let Some(row) = self.thumb_list.row_at_index(page_num) {
+                    self.thumb_list.select_row(Some(&row));
+                    row.grab_focus(); 
+                }
+            }
         }
     }
 

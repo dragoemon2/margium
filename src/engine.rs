@@ -7,6 +7,8 @@ use mathjax_svg::convert_to_svg;
 use gtk4::glib::Bytes;
 use gtk4::gio::{MemoryInputStream, Cancellable};
 use rsvg::{Loader, CairoRenderer};
+use gtk4::gdk;
+use gtk4::glib;
 
 pub struct PdfEngine {
     doc: Option<Document>,
@@ -110,6 +112,10 @@ impl PdfEngine {
             }
         }
         None
+    }
+
+    pub fn get_current_page_number(&self) -> i32 {
+        self.current_page
     }
 
 
@@ -265,5 +271,55 @@ impl PdfEngine {
             }
             context.restore().unwrap();
         }
+    }
+
+
+    pub fn get_page_thumbnail(&self, page_num: i32, target_width: f64) -> Option<gdk::Texture> {
+        let doc = self.doc.as_ref()?;
+        let page = doc.page(page_num)?;
+
+        let (w, h) = page.size();
+        // ★ 高速化ポイント1: 
+        // サムネイルならそこまで高画質でなくて良いので、計算上のスケールを少し小さく見積もる手もありますが、
+        // ここでは受け取った target_width に忠実にしつつ、後でUI側で小さい値を渡すようにします。
+        let scale = target_width / w;
+        let target_height = h * scale;
+
+        let mut surface = cairo::ImageSurface::create(
+            cairo::Format::ARgb32, 
+            target_width as i32, 
+            target_height as i32
+        ).ok()?;
+
+        let context = cairo::Context::new(&surface).ok()?;
+        
+        // ★ 高速化ポイント2: 描画品質を下げる（サムネイルならこれで十分）
+        context.set_antialias(cairo::Antialias::None); // アンチエイリアス無効化で高速化
+        context.set_source_rgb(1.0, 1.0, 1.0); // 背景を白で塗る（透明だと重くなる場合があるため）
+        context.rectangle(0.0, 0.0, target_width, target_height);
+        context.fill().unwrap();
+
+        context.scale(scale, scale);
+        
+        // PDFレンダリング
+        page.render(&context);
+        
+        drop(context);
+        
+        let stride = surface.stride();
+        let width = surface.width();
+        let height = surface.height();
+        let data = surface.data().ok()?;
+        let bytes = glib::Bytes::from(&*data);
+
+        let texture = gdk::MemoryTexture::new(
+            width,
+            height,
+            gdk::MemoryFormat::B8g8r8a8,
+            &bytes,
+            stride as usize,
+        );
+
+        Some(texture.into())
     }
 }

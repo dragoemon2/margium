@@ -30,6 +30,7 @@ pub fn setup(
         let buf = text_buffer.clone();
         let lbl_page = widgets.label_page.clone();
         let lbl_file = filename_label.clone();
+        let sb_view = sidebar.clone();
 
         move || {
             let eng = engine.borrow();
@@ -47,6 +48,12 @@ pub fn setup(
             } else {
                 buf.set_text("");
             }
+
+            // 4. サムネイル更新
+            let current_page = engine.borrow().get_current_page_number();
+            sb_view.scroll_to_thumbnail(current_page);
+            sb_view.update_thumbnails(&eng);
+            
         }
     };
 
@@ -119,14 +126,14 @@ pub fn setup(
                         if let Err(e) = eng.borrow_mut().load_file(path) {
                             eprintln!("Error: {}", e);
                         } else {
+
+                            // サイドバー更新 (Annotationsのみ。Thumbnailsは up() に含まれる)
+                            let eng_ref = eng.borrow();
+                            sb.update_annotations(&eng_ref);
+                            sb.init_thumbnails(eng_ref.get_total_pages());
+
                             // 画面更新
                             up(); 
-                            
-                            // サイドバー更新
-                            // sb は Rc<SidebarWidgets> なのでメソッドを呼べる
-                            let eng_ref = eng.borrow();
-                            sb.update_thumbnails(eng_ref.get_total_pages());
-                            sb.update_annotations(&eng_ref);
                         }
                     }
                 }
