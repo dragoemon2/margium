@@ -2,7 +2,7 @@ use gtk4::prelude::*;
 use gtk4::{
     Box as GtkBox, DrawingArea, Orientation, Paned, ScrolledWindow, 
     TextView, TextBuffer, Separator, 
-    GestureClick, EventControllerScroll, EventControllerScrollFlags,
+    GestureClick, EventControllerScroll, EventControllerScrollFlags, TextTag
 };
 use std::rc::Rc;
 use std::cell::RefCell;

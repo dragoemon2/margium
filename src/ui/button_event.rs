@@ -10,8 +10,12 @@ use std::cell::RefCell;
 use crate::engine::PdfEngine;
 use crate::ui::{UiState};
 use crate::ui::toolbar::ToolbarWidgets;
-use crate::ui::sidebar::{SidebarWidgets, ThumbnailResult};
+use crate::ui::sidebar::{SidebarWidgets, ThumbnailResult, search::SearchResult};
 use crate::annotations;
+use std::sync::{Arc};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use poppler::FindFlags;
+use std::collections::HashMap;
 
 pub fn setup(
     window: &ApplicationWindow,
@@ -53,9 +57,7 @@ pub fn setup(
 
             // 4. サムネイル更新
             let current_page = engine.borrow().get_current_page_number();
-            sb_view.scroll_to_thumbnail(current_page);
-            // sb_view.update_thumbnails(&eng);
-            
+            sb_view.thumbnails.scroll_to_thumbnail(current_page);
         }
     };
 
@@ -129,11 +131,12 @@ pub fn setup(
                         if let Err(e) = eng.borrow_mut().load_file(path.clone()) {
                             eprintln!("Error: {}", e);
                         } else {
-                            // サイドバー更新 (Annotationsのみ。Thumbnailsは up() に含まれる)
-                            let eng_ref = eng.borrow();
-                            sb.update_annotations(&eng_ref);
-                            sb.prepare_empty_thumbnails(eng_ref.get_total_pages());
-                            // sb.init_thumbnails(eng_ref.get_total_pages());
+                            let total_pages = eng.borrow().get_total_pages();
+                            {
+                                let eng_ref = eng.borrow();
+                                sb.annotations.update_annotations(&eng_ref);
+                            } 
+                            sb.thumbnails.prepare_empty_thumbnails(total_pages);
 
                             // 画面更新
                             up(); 
@@ -183,7 +186,7 @@ pub fn setup(
                                         res.stride as usize,
                                     );
                                     // サイドバーに反映
-                                    sidebar_async.set_thumbnail_image(res.page_index, &texture.into());
+                                    sidebar_async.thumbnails.set_thumbnail_image(res.page_index, &texture.into());
                                 }
                             });
 
@@ -275,12 +278,198 @@ pub fn setup(
 
     // ボタンに接続
     let open_action_clone = open_action.clone(); // クローンしてボタン用に使う
-    // widgets.btn_open.connect_clicked(move |_| {
-    //     open_action_clone();
-    // });
     widgets.btn_open.connect_clicked(move |_| {
         open_action_clone();
     });
+
+    // ---------------------------------------------------------
+    // Sidebarクリックイベント
+    // ---------------------------------------------------------
+
+    // Thumbnails Click
+    let eng_thumb = engine.clone();
+    let area_thumb = drawing_area.clone();
+    let up_key = update_view.clone();
+    
+    sidebar.thumbnails.list.connect_row_selected(move |_, row| {
+        if let Some(r) = row {
+            let idx = r.index(); // 0-based
+            if let Ok(mut eng) = eng_thumb.try_borrow_mut() {
+                if eng.jump_to_page(idx) {
+                    area_thumb.queue_draw();
+                }
+            }
+            up_key();
+        }
+    });
+
+    // ---------------------------------------------------------
+    // 検索機能 (非同期 & ハイライト)
+    // ---------------------------------------------------------
+    
+    let (search_sender, search_receiver) = async_channel::unbounded::<SearchResult>();
+    let request_id = Arc::new(AtomicUsize::new(0));
+
+    let sidebar_search_recv = sidebar.clone();
+    let current_req_id_recv = request_id.clone();
+    let eng_search_recv = engine.clone();
+    let area_search_recv = drawing_area.clone();
+    let search_buffer = Rc::new(RefCell::new(HashMap::new()));
+    let search_buffer_recv = search_buffer.clone();
+
+    // 受信側 (メインスレッド)
+    gtk4::glib::MainContext::default().spawn_local(async move {
+        while let Ok(res) = search_receiver.recv().await {
+            let current = current_req_id_recv.load(Ordering::SeqCst);
+            if res.req_id == current {
+                // 1. サイドバーのリストに追加 (既存)
+                sidebar_search_recv.search.append_result(res.clone());
+
+                // 2. バッファに蓄積 (ページごとの矩形リスト)
+                // 同じページに複数ヒットする場合もあるので、既存のリストに追記するか、
+                // SearchResultが「そのページの全矩形」を持っているなら上書きでOK
+                search_buffer_recv.borrow_mut().insert(res.page, res.rects);
+                
+                // 3. エンジンに渡して即反映 (リアルタイム更新)
+                // 毎回渡すと少し重いかもしれないが、UX的には良い
+                if let Ok(mut eng) = eng_search_recv.try_borrow_mut() {
+                    let map = search_buffer_recv.borrow().clone();
+                    eng.set_all_search_results(map);
+                    // 画面更新 (現在のページにヒットした場合、即座に赤枠が出る)
+                    area_search_recv.queue_draw();
+                }
+            }
+        }
+    });
+
+    // ★追加: 検索結果リストのクリックイベント処理
+    let eng_search_click = engine.clone();
+    let sidebar_search_click = sidebar.clone();
+    let area_search_click = drawing_area.clone();
+    let up_key = update_view.clone();
+
+    sidebar.search.list.connect_row_activated(move |_, row| {
+        let name = row.widget_name();
+        // 名前からインデックスを取り出す
+        if let Ok(idx) = name.as_str().parse::<usize>() {
+            // インデックスを元にデータを取り出す
+            if let Some(res) = sidebar_search_click.search.get_result_data(idx) {
+                // Engineを安全に借用
+                if let Ok(mut eng) = eng_search_click.try_borrow_mut() {
+                    // 1. 該当ページへジャンプ（これで古いハイライトは消える）
+                    eng.jump_to_page(res.page);
+                    
+                    // 3. 再描画
+                    area_search_click.queue_draw();
+                }
+            }
+        }
+        up_key();
+    });
+
+
+    // 送信側 (入力イベント -> ワーカースレッド起動)
+    let eng_search = engine.clone();
+    let sidebar_search_entry = sidebar.clone();
+    let sender_clone = search_sender.clone();
+    let area_search = drawing_area.clone();
+
+    let debounce_timer = Rc::new(RefCell::new(None::<glib::SourceId>));
+
+    sidebar.search.entry.connect_search_changed(move |entry| {
+        let query = entry.text().to_string();
+        
+        // クローン類
+        let sb = sidebar_search_entry.clone();
+        let sender = sender_clone.clone();
+        let eng = eng_search.clone(); // 名前を短縮
+        let req_id = request_id.clone();
+        let search_buf = search_buffer.clone();
+        
+        // タイマー制御用のクローン
+        let timer_store = debounce_timer.clone();
+
+        // ★追加: 2. 既存のタイマーがあればキャンセル（連打対策）
+        if let Some(source_id) = timer_store.borrow_mut().take() {
+            source_id.remove();
+        }
+
+        // ★追加: 3. 新しいタイマーをセット (200ms後に実行)
+        let new_source_id = glib::timeout_add_local(
+            std::time::Duration::from_millis(500), 
+            move || {
+                // === ここから元の検索ロジック ===
+
+                // ID発行（実行が決まってから発行する）
+                let new_id = req_id.fetch_add(1, Ordering::SeqCst) + 1;
+                
+                sb.search.clear_results();
+                
+                // 検索バッファとキャッシュのクリア
+                search_buf.borrow_mut().clear();
+                if let Ok(mut e) = eng.try_borrow_mut() {
+                    e.clear_search_results();
+                }
+
+                if query.is_empty() {
+                    sb.search.set_status("Ready");
+                    // タイマー終了時は None に戻して Break
+                    *timer_store.borrow_mut() = None;
+                    return glib::ControlFlow::Break;
+                }
+                
+                sb.search.set_status("Searching...");
+
+                let pdf_path_opt = if let Ok(e) = eng.try_borrow() {
+                    e.get_filepath().clone() 
+                } else {
+                    None
+                };
+
+                if let Some(path) = pdf_path_opt {
+                    let sender = sender.clone();
+                    let query_clone = query.clone();
+                    
+                    std::thread::spawn(move || {
+                        let uri = format!("file://{}", path.to_str().unwrap_or(""));
+                        
+                        if let Ok(doc) = poppler::Document::from_file(&uri, None) {
+                            let total = doc.n_pages();
+
+                            for i in 0..total {
+                                if let Some(page) = doc.page(i) {
+                                    let flags = FindFlags::DEFAULT | FindFlags::IGNORE_DIACRITICS | FindFlags::MULTILINE;
+                                    let matches = page.find_text_with_options(&query_clone, flags);
+
+                                    if !matches.is_empty() {
+                                        let res = SearchResult {
+                                            page: i,
+                                            display_text: format!("Found {} matches", matches.len()), // 簡易表示
+                                            req_id: new_id,
+                                            rects: matches,
+                                        };
+                                        
+                                        if sender.send_blocking(res).is_err() {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+                
+                // === ロジック終了 ===
+
+                *timer_store.borrow_mut() = None;
+                glib::ControlFlow::Break
+            }
+        );
+
+        // ★追加: 4. 新しいタイマーIDを保存
+        *debounce_timer.borrow_mut() = Some(new_source_id);
+    });
+
 
     // ---------------------------------------------------------
     // ショートカットキー (Window全体のイベント)

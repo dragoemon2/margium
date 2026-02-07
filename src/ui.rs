@@ -1,15 +1,18 @@
+// src/ui.rs
+
 use gtk4::prelude::*;
 use gtk4::{Application, ApplicationWindow, Label, Orientation, Separator};
 use std::cell::RefCell;
 use std::rc::Rc;
 use crate::engine::PdfEngine;
 
-// モジュール宣言 (フォルダ構成に合わせて配置してください)
-mod toolbar;
-mod main_content;
-mod popover_menu;
-mod button_event;
-mod sidebar;
+// モジュール宣言
+// uiフォルダ内に各ファイルを配置している前提です
+pub mod toolbar;
+pub mod main_content;
+pub mod popover_menu;
+pub mod button_event;
+pub mod sidebar; // sidebarフォルダ内の mod.rs を参照します
 
 pub struct UiState {
     pub scale: f64,
@@ -43,7 +46,8 @@ pub fn build(app: &Application) {
     // ポップオーバー (アノテーション用)
     popover_menu::setup(&window, &drawing_area, engine.clone(), ui_state.clone());
 
-    // サイドバー
+    // サイドバー構築
+    // sidebar::build は内部で各サブウィジェット(ThumbnailWidget等)を生成して返します
     let sidebar = Rc::new(sidebar::build(
         engine.clone(), 
         &drawing_area
@@ -54,6 +58,7 @@ pub fn build(app: &Application) {
     let main_layout = gtk4::Box::new(Orientation::Horizontal, 0);
     window.set_child(Some(&main_layout));
 
+    // SidebarWidgets は container という GtkBox を持っているのでそれを配置
     main_layout.append(&sidebar.container);
     main_layout.append(&Separator::new(Orientation::Vertical));
 
