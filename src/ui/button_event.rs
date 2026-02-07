@@ -480,6 +480,7 @@ pub fn setup(
     let ui_key = ui_state.clone();
     let area_key = drawing_area.clone();
     let up_key = update_view.clone();
+    let sb_key = sidebar.clone();
     
     // open_action は Clone ではないので、再度定義するか、Rcで包むなどの工夫が必要ですが、
     // ここではシンプルにもう一度 Dialog ロジックを書くか、Openボタンのクリックを発火させます。
@@ -521,6 +522,12 @@ pub fn setup(
             gdk::Key::o if state.contains(gdk::ModifierType::CONTROL_MASK) => {
                 // ボタンのクリックイベントを発火させる（ロジックを再利用）
                 btn_open_ref.emit_clicked();
+                true
+            }
+            gdk::Key::f if state.contains(gdk::ModifierType::CONTROL_MASK) => {
+                // フォーカスを検索エントリに移す
+                sb_key.stack.set_visible_child_name("search");
+                sb_key.search.entry.grab_focus();
                 true
             }
             _ => false,

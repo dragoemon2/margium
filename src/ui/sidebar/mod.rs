@@ -23,6 +23,7 @@ pub use thumbnail::ThumbnailResult;
 // pub use search::SearchResult; // 必要に応じて
 
 pub struct SidebarWidgets {
+    pub stack: Stack,
     pub container: GtkBox,
     pub thumbnails: ThumbnailWidget,
     pub outline: OutlineWidget,
@@ -83,6 +84,7 @@ pub fn build(
     let s = stack.clone(); btn_search.connect_clicked(move |_| s.set_visible_child_name("search"));
 
     SidebarWidgets {
+        stack,
         container,
         thumbnails,
         outline,
