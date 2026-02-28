@@ -5,7 +5,7 @@ use gtk4::{
 };
 use std::rc::Rc;
 use std::cell::RefCell;
-use crate::engine::PdfEngine;
+use crate::engine::{self, PdfEngine};
 
 pub struct ThumbnailResult {
     pub page_index: i32,
@@ -36,12 +36,12 @@ impl ThumbnailWidget {
         Self { list, scroll }
     }
 
-    pub fn prepare_empty_thumbnails(&self, total_pages: i32) {
+    pub fn prepare_empty_thumbnails(&self, engine: &PdfEngine) {
         while let Some(child) = self.list.first_child() {
             self.list.remove(&child);
         }
 
-        for i in 0..total_pages {
+        for i in 0..engine.get_total_pages() {
             let row = ListBoxRow::new();
             let vbox = GtkBox::new(Orientation::Vertical, 5);
             vbox.set_margin_top(10);
@@ -52,7 +52,9 @@ impl ThumbnailWidget {
             image_widget.set_pixel_size(150);
             image_widget.set_icon_name(Some("image-loading-symbolic"));
             
-            let label = Label::new(Some(&format!("{}", i + 1)));
+            let label_text = engine.get_page_label(i)
+                .unwrap_or_else(|| format!("{}", i + 1));
+            let label = Label::new(Some(&label_text));
             
             vbox.append(&image_widget);
             vbox.append(&label);

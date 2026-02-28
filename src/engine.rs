@@ -12,6 +12,9 @@ use gtk4::glib;
 use poppler::Rectangle;
 use std::collections::HashMap;
 use crate::ui::sidebar::outline::OutlineItem;
+use rsvg::SvgHandle;
+use pango::FontDescription;
+use pangocairo::functions::{create_layout, show_layout};
 
 pub struct PdfEngine {
     doc: Option<Document>,
@@ -25,6 +28,11 @@ pub struct PdfEngine {
     pub highlight_rects: Vec<Rectangle>,
     pub search_results_cache: HashMap<i32, Vec<Rectangle>>,
     
+}
+
+enum DrawPart {
+    Text(String, f64), // テキスト内容, 幅
+    Math(SvgHandle, f64, f64, f64), // Handle, 描画幅, スケール, 元の高さ
 }
 
 impl PdfEngine {
@@ -97,10 +105,29 @@ impl PdfEngine {
 
     pub fn page_info(&self) -> String {
         if self.total_pages > 0 {
-            format!("{} / {}", self.current_page + 1, self.total_pages)
+            let physical_info = format!("{} / {}", self.current_page + 1, self.total_pages);
+            
+            if let Some(label) = self.get_page_label(self.current_page) {
+                // ラベルがある場合: "Label (Physical / Total)"
+                format!("{} ({})", label, physical_info)
+            } else {
+                // ラベルがない場合: "Physical / Total"
+                physical_info
+            }
         } else {
             " - ".to_string()
         }
+    }
+
+    pub fn get_page_label(&self, page_index: i32) -> Option<String> {
+        if let Some(doc) = &self.doc {
+            if let Some(page) = doc.page(page_index) {
+                // poppler-rs の label() メソッドを使用
+                // GString を String に変換
+                return page.label().map(|s| s.to_string());
+            }
+        }
+        None
     }
 
     pub fn get_page_size(&self) -> Option<(f64, f64)> {
@@ -277,72 +304,73 @@ impl PdfEngine {
     fn draw_custom_annotations(&self, context: &Context, scale: f64) {
         let current_page_u32 = (self.current_page + 1) as u32;
         
-        // 現在のページのアノテーションのみ抽出
         for ann in self.annotations.iter().filter(|a| a.page == current_page_u32) {
-            
             context.save().unwrap();
-            
-            // 座標変換: アノテーションの位置へ移動 (scaleも考慮)
             context.translate(ann.x * scale, ann.y * scale);
 
-            // 数式かどうかの判定 ($$で囲まれているか)
-            if ann.content.starts_with("$$") && ann.content.ends_with("$$") {
-                let latex = &ann.content[2..ann.content.len()-2];
-                
-                // MathJaxによるSVG変換
-                if let Ok(svg_string) = convert_to_svg(latex) {
-                    let loader = Loader::new();
-                    let stream = MemoryInputStream::from_bytes(&Bytes::from(svg_string.as_bytes()));
-                    
-                    if let Ok(handle) = loader.read_stream(
-                        &stream, 
-                        None::<&gtk4::gio::File>, // ← ここを修正
-                        None::<&Cancellable>
-                    ) {
-                        let renderer = CairoRenderer::new(&handle);
-                        
-                        let rect = renderer.intrinsic_dimensions();
-                        let w = rect.width.length;
-                        let h = rect.height.length;
-                        
-                        // フォントサイズに合わせてスケール調整 (目標高さ: 30px程度)
-                        let target_h = 30.0; // 本来は ann.font_size から計算しても良い
-                        let s = if h > 0.0 { target_h / h } else { 1.0 };
-                        
-                        context.scale(s, s);
-                        
-                        // 背景 (白の透過) - 数式を見やすくする
-                        context.set_source_rgba(1.0, 1.0, 1.0, 0.9);
-                        context.rectangle(0.0, 0.0, w, h);
-                        context.fill().unwrap();
+            // フォントサイズ (これが全体のスケール基準になります)
+            let font_size = ann.font_size.unwrap_or(14.0) as f64;
 
-                        // 数式描画
-                        let _ = renderer.render_document(
-                                context,
-                                &cairo::Rectangle::new(0.0, 0.0, w, h) // ← newメソッドを使う
-                            );
-                    }
-                } else {
-                    // SVG変換エラー時のフォールバック
-                    context.set_source_rgb(1.0, 0.0, 0.0);
-                    context.show_text("Math Error").unwrap();
+            // ★方針変更:
+            // 中身を \text{ ... } で囲んで、全体を1つのLaTeX数式として処理する。
+            // これにより "Hello $x^2$" のような混在も、LaTeXの \text{Hello $x^2$} として正しくレンダリングされる。
+            let latex = format!("\\text{{{}}}", ann.content);
+
+            // 1. SVG変換を試みる
+            if let Ok(svg_string) = convert_to_svg(&latex) {
+                let loader = Loader::new();
+                let stream = MemoryInputStream::from_bytes(&Bytes::from(svg_string.as_bytes()));
+                
+                if let Ok(handle) = loader.read_stream(&stream, None::<&gtk4::gio::File>, None::<&Cancellable>) {
+                    let renderer = CairoRenderer::new(&handle);
+                    
+                    let rect = renderer.intrinsic_dimensions();
+                    let w = rect.width.length;
+                    let h = rect.height.length;
+
+                    // 2. サイズ計算
+                    let target_h = font_size * 1.5; 
+                    let s = if h > 0.0 { target_h / h } else { 1.0 };
+                    
+                    let draw_w = w * s;
+                    let draw_h = h * s;
+
+                    // 3. 背景描画 (黄色い付箋)
+                    context.set_source_rgba(1.0, 1.0, 0.8, 0.8);
+                    context.rectangle(0.0, 0.0, draw_w + 10.0, draw_h); // 少し横に余白(+10.0)
+                    context.fill().unwrap();
+
+                    // 4. SVG描画
+                    let offset_x = 5.0;
+                    let offset_y = (draw_h - (h * s)) / 2.0;
+
+                    context.save().unwrap();
+                    context.translate(offset_x, offset_y);
+                    context.scale(s, s);
+                    
+                    let _ = renderer.render_document(
+                        context,
+                        &cairo::Rectangle::new(0.0, 0.0, w, h)
+                    );
+                    context.restore().unwrap();
                 }
             } else {
-                // 通常のテキスト描画 (Pangoを使用するのがベストですが、簡易的にCairoで)
-                context.set_source_rgba(1.0, 1.0, 0.8, 0.8); // 付箋っぽい背景
-                context.rectangle(0.0, 0.0, 100.0, 20.0);    // 仮のサイズ
+                // SVG変換失敗時（LaTeX構文エラーなど）のフォールバック
+                // 通常のテキストとして描画
+                context.set_source_rgba(1.0, 0.8, 0.8, 0.8); // エラー時は赤っぽい背景
+                context.rectangle(0.0, 0.0, 100.0, 20.0);
                 context.fill().unwrap();
 
                 context.set_source_rgb(0.0, 0.0, 0.0);
                 context.select_font_face("Sans", cairo::FontSlant::Normal, cairo::FontWeight::Normal);
-                context.set_font_size(14.0);
-                context.move_to(5.0, 15.0);
+                context.set_font_size(font_size);
+                context.move_to(5.0, font_size);
                 context.show_text(&ann.content).unwrap();
             }
+
             context.restore().unwrap();
         }
     }
-
 
     
     pub fn get_page_thumbnail(&self, page_num: i32, target_width: f64) -> Option<gdk::Texture> {
@@ -398,86 +426,5 @@ impl PdfEngine {
         self.filepath.clone()
     }
 
-    // pub fn get_outline(&self) -> Vec<OutlineItem> {
-    //     let mut result = Vec::new();
-        
-    //     if let Some(doc) = &self.doc {
-    //          // poppler-rs のバージョンによってメソッドが異なります
-    //          // doc.find_dest() ではなく、イテレータで取得するのが一般的
-             
-    //          if let Some(iter) = doc.index_iter() {
-    //              self.walk_index(iter, 0, &mut result);
-    //          }
-    //     }
-    //     result
-    // }
-
-    // // // 再帰的にツリーを辿る
-    // // fn walk_index(&self, mut iter: poppler::IndexIter, level: i32, list: &mut Vec<OutlineItem>) {
-    // //     // 全ての兄弟ノードをループ
-    // //     loop {
-    // //         // 現在のノードのアクションを取得
-    // //         let mut page_index = None;
-            
-    // //         if let Some(action) = iter.action() {
-    // //             // アクションからページ番号を解決
-    // //             // (GotoDest, Named などがある)
-    // //             match action.type_() {
-    // //                 poppler::ActionType::GotoDest => {
-    // //                     if let Some(dest) = action.as_goto_dest() {
-    // //                          if let Some(dest) = dest.dest() {
-    // //                              // Named Destinationの場合、ドキュメントから解決が必要
-    // //                              if let Some(resolved) = self.doc.as_ref().and_then(|d| d.find_dest(dest.as_str())) {
-    // //                                  page_index = Some(resolved.page_num() - 1); // 1-based -> 0-based
-    // //                              }
-    // //                          } else {
-    // //                              // 直接ページ指定の場合
-    // //                              // dest.page_num() があれば使う (バージョンによる)
-    // //                          }
-    // //                     }
-    // //                 },
-    // //                 // Namedアクション
-    // //                 poppler::ActionType::Named => {
-    // //                     if let Some(named) = action.as_named() {
-    // //                         if let Some(name) = named.named_dest() {
-    // //                             if let Some(resolved) = self.doc.as_ref().and_then(|d| d.find_dest(&name)) {
-    // //                                 page_index = Some(resolved.page_num() - 1);
-    // //                             }
-    // //                         }
-    // //                     }
-    // //                 }
-    // //                 _ => {}
-    // //             }
-    // //         }
-
-    // //         // タイトル取得
-    // //         // (APIによっては iter.action().title() だったり iter.title() だったりします)
-    // //         // ここでは Action からタイトルが取れると仮定、または IndexIter 自体が持っている場合
-    // //         // poppler-rs 0.22では `iter.action().map(|a| a.title())` 等
-            
-    // //         // 安全策: action経由でタイトルが取れればそれを、ダメなら "Untitled"
-    // //         let title = if let Some(action) = iter.action() {
-    // //             action.title().unwrap_or("Untitled".to_string())
-    // //         } else {
-    // //             "Untitled".to_string()
-    // //         };
-
-    // //         list.push(OutlineItem {
-    // //             title,
-    // //             page_index,
-    // //             level,
-    // //         });
-
-    // //         // 子ノードがあれば再帰
-    // //         if let Some(child_iter) = iter.child() {
-    // //             self.walk_index(child_iter, level + 1, list);
-    // //         }
-
-    // //         // 次の兄弟へ (なければ終了)
-    // //         if !iter.next() {
-    // //             break;
-    // //         }
-    // //     }
-    // // }
 
 }

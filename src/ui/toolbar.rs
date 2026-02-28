@@ -10,6 +10,8 @@ use gtk4::{
 pub struct ToolbarWidgets {
     pub container: GtkBox,
     pub btn_open: Button,
+    pub btn_save: Button,
+    pub btn_save_as: Button,
     pub btn_prev: Button,
     pub btn_next: Button,
     pub btn_zoom_in: Button,
@@ -37,11 +39,15 @@ pub fn build(filename_label: &Label) -> ToolbarWidgets {
     let label_page = Label::new(Some(" - / - "));
     let btn_next = Button::with_label("▶");
     let btn_open = Button::with_label("📂 Open");
+    let btn_save = Button::with_label("💾 Save");
+    let btn_save_as = Button::with_label("💾 Save As");
     let btn_zoom_in = Button::with_label("🔍 Zoom In");
     let btn_zoom_out = Button::with_label("🔍 Zoom Out");
 
     // 配置
     toolbar.append(&btn_open);
+    toolbar.append(&btn_save);
+    toolbar.append(&btn_save_as);
     toolbar.append(&Separator::new(Orientation::Vertical));
     toolbar.append(&btn_prev);
     toolbar.append(&label_page);
@@ -53,6 +59,8 @@ pub fn build(filename_label: &Label) -> ToolbarWidgets {
     ToolbarWidgets {
         container: toolbar,
         btn_open,
+        btn_save,
+        btn_save_as,
         btn_prev,
         btn_next,
         btn_zoom_in,

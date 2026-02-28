@@ -131,12 +131,11 @@ pub fn setup(
                         if let Err(e) = eng.borrow_mut().load_file(path.clone()) {
                             eprintln!("Error: {}", e);
                         } else {
-                            let total_pages = eng.borrow().get_total_pages();
                             {
                                 let eng_ref = eng.borrow();
                                 sb.annotations.update_annotations(&eng_ref);
+                                sb.thumbnails.prepare_empty_thumbnails(&eng_ref);
                             } 
-                            sb.thumbnails.prepare_empty_thumbnails(total_pages);
 
                             // 画面更新
                             up(); 
@@ -281,6 +280,8 @@ pub fn setup(
     widgets.btn_open.connect_clicked(move |_| {
         open_action_clone();
     });
+
+
 
     // ---------------------------------------------------------
     // Sidebarクリックイベント
