@@ -1,20 +1,20 @@
-use poppler::{Document, ActionType, LinkMapping};
+use poppler::{Document};
 use std::path::PathBuf;
 use cairo::Context;
 use crate::annotations::{AnnotationData};
 
+
+use std::fs::File;
+use std::io::Write;
+use std::env;
 use mathjax_svg::convert_to_svg;
-use gtk4::glib::Bytes;
-use gtk4::gio::{MemoryInputStream, Cancellable};
 use rsvg::{Loader, CairoRenderer};
 use gtk4::gdk;
 use gtk4::glib;
 use poppler::Rectangle;
 use std::collections::HashMap;
-use crate::ui::sidebar::outline::OutlineItem;
 use rsvg::SvgHandle;
-use pango::FontDescription;
-use pangocairo::functions::{create_layout, show_layout};
+
 
 pub struct PdfEngine {
     doc: Option<Document>,
@@ -27,6 +27,7 @@ pub struct PdfEngine {
     pub annotations: Vec<AnnotationData>,
     pub highlight_rects: Vec<Rectangle>,
     pub search_results_cache: HashMap<i32, Vec<Rectangle>>,
+    pub active_annotation_id: Option<String>,
     
 }
 
@@ -47,6 +48,7 @@ impl PdfEngine {
             annotations: Vec::new(),
             highlight_rects: Vec::new(),
             search_results_cache: HashMap::new(),
+            active_annotation_id: None,
         }
     }
 
@@ -163,18 +165,22 @@ impl PdfEngine {
 
     pub fn add_annotation(&mut self, text: &str, x: f64, y: f64) -> Result<(), String> {
         // 1. リストに追加
+        let new_id = uuid::Uuid::new_v4().to_string();
         self.annotations.push(AnnotationData {
             page: (self.current_page + 1) as u32, // lopdfは1-based
             x,
             y,
             content: text.to_string(),
             font_size: Some(14.0),
-            id: uuid::Uuid::nil().to_string(),
+            id: new_id.clone(),
             object_id: None,
         });
 
+        self.active_annotation_id = Some(new_id.clone());
         Ok(())
     }
+
+    
 
     // 検索結果を丸ごと受け取るメソッド
     pub fn set_all_search_results(&mut self, results: HashMap<i32, Vec<Rectangle>>) {
@@ -198,9 +204,8 @@ impl PdfEngine {
         }
     }
 
+    // PDF描画処理 
     pub fn draw(&self, context: &Context, area_width: f64, area_height: f64, scale: f64) {
-        // ---------------------- PDF描画処理 ----------------------
-
         // 1. 背景をダークグレーで塗りつぶす
         context.set_source_rgb(0.2, 0.2, 0.2);
         context.paint().expect("Painting failed");
@@ -257,10 +262,6 @@ impl PdfEngine {
                     let (_, page_h) = page.size();
 
                     for rect in &self.highlight_rects {
-                        // --- 座標変換ロジック ---
-                        // PDF: 左下が(0,0)。Yは上に向かって増える。
-                        // Cairo: 左上が(0,0)。Yは下に向かって増える。
-                        
                         // 1. PDF座標系での「上端」と「下端」を整理
                         // (Popplerの矩形は y1 < y2 とは限らないため念のため min/max を使う)
                         let pdf_y_bottom = rect.y1().min(rect.y2());
@@ -306,69 +307,138 @@ impl PdfEngine {
         
         for ann in self.annotations.iter().filter(|a| a.page == current_page_u32) {
             context.save().unwrap();
-            context.translate(ann.x * scale, ann.y * scale);
+            context.translate(ann.x, ann.y);
 
-            // フォントサイズ (これが全体のスケール基準になります)
             let font_size = ann.font_size.unwrap_or(14.0) as f64;
 
-            // ★方針変更:
-            // 中身を \text{ ... } で囲んで、全体を1つのLaTeX数式として処理する。
-            // これにより "Hello $x^2$" のような混在も、LaTeXの \text{Hello $x^2$} として正しくレンダリングされる。
-            let latex = format!("\\text{{{}}}", ann.content);
+            // ★変更: 複数行対応
+            // 改行で分割し、LaTeXの \begin{array}{l} (左揃え) に展開する
+            let lines: Vec<&str> = ann.content.split('\n').collect();
+            let mut latex = String::from("\\begin{array}{l}\n");
+            
+            for (i, line) in lines.iter().enumerate() {
+                // 空行対策（空行だと高さが潰れるためダミー文字を見えなくして置く）
+                if line.trim().is_empty() {
+                    latex.push_str("\\text{\\phantom{A}}"); 
+                } else {
+                    latex.push_str(&format!("\\text{{{}}}", line));
+                }
+                
+                // 最後の行以外は改行記号 \\ をつける
+                if i < lines.len() - 1 {
+                    latex.push_str(" \\\\\n");
+                } else {
+                    latex.push_str("\n");
+                }
+            }
+            latex.push_str("\\end{array}");
 
             // 1. SVG変換を試みる
+            let mut final_w = 100.0;
+            let mut final_h = 20.0;
+
             if let Ok(svg_string) = convert_to_svg(&latex) {
+                // ... (ここからSVG保存〜描画のロジックは既存のまま) ...
+                let temp_path = env::temp_dir().join(format!("math_{}.svg", ann.id));
+                if let Ok(mut file) = File::create(&temp_path) {
+                    let _ = file.write_all(svg_string.as_bytes());
+                }
+
                 let loader = Loader::new();
-                let stream = MemoryInputStream::from_bytes(&Bytes::from(svg_string.as_bytes()));
-                
-                if let Ok(handle) = loader.read_stream(&stream, None::<&gtk4::gio::File>, None::<&Cancellable>) {
+                if let Ok(handle) = loader.read_path(&temp_path) {
                     let renderer = CairoRenderer::new(&handle);
-                    
                     let rect = renderer.intrinsic_dimensions();
                     let w = rect.width.length;
                     let h = rect.height.length;
 
-                    // 2. サイズ計算
-                    let target_h = font_size * 1.5; 
+                    let target_h = (font_size * 1.5) * lines.len() as f64; 
                     let s = if h > 0.0 { target_h / h } else { 1.0 };
-                    
                     let draw_w = w * s;
                     let draw_h = h * s;
 
-                    // 3. 背景描画 (黄色い付箋)
+                    final_w = draw_w + 10.0;
+                    final_h = draw_h;
+
                     context.set_source_rgba(1.0, 1.0, 0.8, 0.8);
-                    context.rectangle(0.0, 0.0, draw_w + 10.0, draw_h); // 少し横に余白(+10.0)
+                    context.rectangle(-5.0, 0.0, final_w, final_h);
                     context.fill().unwrap();
 
-                    // 4. SVG描画
-                    let offset_x = 5.0;
+                    let offset_x = 0.0;
                     let offset_y = (draw_h - (h * s)) / 2.0;
 
                     context.save().unwrap();
                     context.translate(offset_x, offset_y);
                     context.scale(s, s);
-                    
-                    let _ = renderer.render_document(
-                        context,
-                        &cairo::Rectangle::new(0.0, 0.0, w, h)
-                    );
+                    let _ = renderer.render_document(context, &cairo::Rectangle::new(0.0, 0.0, w, h));
                     context.restore().unwrap();
                 }
+                let _ = std::fs::remove_file(&temp_path);
             } else {
-                // SVG変換失敗時（LaTeX構文エラーなど）のフォールバック
-                // 通常のテキストとして描画
-                context.set_source_rgba(1.0, 0.8, 0.8, 0.8); // エラー時は赤っぽい背景
-                context.rectangle(0.0, 0.0, 100.0, 20.0);
+                // ★変更: 変換失敗時のフォールバックも複数行描画に対応
+                let line_h = font_size * 1.5;
+                final_w = 150.0; 
+                final_h = line_h * lines.len() as f64;
+
+                context.set_source_rgba(1.0, 0.8, 0.8, 0.8); 
+                context.rectangle(-5.0, 0.0, final_w, final_h);
                 context.fill().unwrap();
 
                 context.set_source_rgb(0.0, 0.0, 0.0);
                 context.select_font_face("Sans", cairo::FontSlant::Normal, cairo::FontWeight::Normal);
                 context.set_font_size(font_size);
-                context.move_to(5.0, font_size);
-                context.show_text(&ann.content).unwrap();
+                
+                for (i, line) in lines.iter().enumerate() {
+                    context.move_to(0.0, font_size + (i as f64 * line_h));
+                    context.show_text(line).unwrap();
+                }
+            }
+
+            // 選択枠（青い破線）の描画
+            if Some(&ann.id) == self.active_annotation_id.as_ref() {
+                context.set_source_rgb(0.0, 0.5, 1.0);
+                context.set_line_width(2.0);
+                context.set_dash(&[4.0, 4.0], 0.0);
+                context.rectangle(-7.0, -2.0, final_w + 4.0, final_h + 4.0);
+                context.stroke().unwrap();
+                context.set_dash(&[], 0.0);
             }
 
             context.restore().unwrap();
+        }
+    }
+
+
+    pub fn hit_test_annotation(&self, pdf_x: f64, pdf_y: f64) -> Option<String> {
+        let current_page_u32 = (self.current_page + 1) as u32;
+        
+        // 前面（配列の後ろ）から判定する
+        for ann in self.annotations.iter().rev().filter(|a| a.page == current_page_u32) {
+            let font_size = ann.font_size.unwrap_or(14.0) as f64;
+            // SVGの正確な幅はキャッシュしていないため、文字数から大まかな当たり判定ボックスを作成
+            let estimated_width = (ann.content.len() as f64 * font_size * 0.8).max(40.0);
+            let estimated_height = font_size * 2.0;
+
+            // マージンを含めた矩形判定
+            if pdf_x >= ann.x - 10.0 && pdf_x <= ann.x + estimated_width + 10.0 &&
+               pdf_y >= ann.y - 10.0 && pdf_y <= ann.y + estimated_height + 10.0 {
+                return Some(ann.id.clone());
+            }
+        }
+        None
+    }
+
+    pub fn update_active_annotation_content(&mut self, content: &str) {
+        if let Some(id) = &self.active_annotation_id {
+            if let Some(ann) = self.annotations.iter_mut().find(|a| &a.id == id) {
+                ann.content = content.to_string();
+            }
+        }
+    }
+
+    pub fn move_annotation(&mut self, id: &str, new_x: f64, new_y: f64) {
+        if let Some(ann) = self.annotations.iter_mut().find(|a| a.id == id) {
+            ann.x = new_x;
+            ann.y = new_y;
         }
     }
 

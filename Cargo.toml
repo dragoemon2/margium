@@ -4,15 +4,23 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-cairo-rs = "0.22.0"
-glib = "0.22.2"
-gtk4 = "0.11.0"
-pango = "0.22.0"
-poppler-rs = "0.26.0"
+# --- 0.21 エコシステムに統一 ---
+cairo-rs = "0.21"
+glib = "0.21"
+gtk4 = "0.10"        # 0.21世代のgtk4
+pango = "0.21"
+pangocairo = "0.21"
+poppler-rs = "0.25" # 0.21世代のpoppler-rs
+
+# --- その他のクレート ---
+librsvg = "2.61.3"
 lopdf = "0.39.0"
 chrono = "0.4.43"
-uuid = "1.20.0"
 async-channel = "2.5.0"
 mathjax_svg = "3.1.2"
-librsvg = "2.61.3"
-pangocairo = "0.22.0"
+
+[dependencies.uuid]
+version = "1.20.0"
+features = [
+    "v4",
+]
